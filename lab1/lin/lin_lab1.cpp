@@ -18,6 +18,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <time.h>
 
 // ====== CLR + pause (как на Win, только для Linux терминала) ======
 static void clr() {
