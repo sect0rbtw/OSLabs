@@ -198,12 +198,6 @@ static void Cmd_CreateFile() {
         return;
     }
 
-    const char* msg = "Hello!\r\n";
-    DWORD written = 0;
-    BOOL ok = WriteFile(h, msg, (DWORD)strlen(msg), &written, nullptr);
-    if (!ok) std::wcerr << L"WriteFile failed: " << LastErrorMsg() << L"\n";
-    else std::wcout << L"Wrote " << written << L" bytes\n";
-
     CloseHandle(h);
 }
 
@@ -311,6 +305,37 @@ static void Cmd_GetFileInformationByHandle() {
     CloseHandle(h);
 }
 
+static void PrintFileTime(const wchar_t* label, const FILETIME& ft) {
+    SYSTEMTIME utc{}, local{};
+    // FILETIME -> UTC SYSTEMTIME
+    if (!FileTimeToSystemTime(&ft, &utc)) {
+        std::wcout << label << L": <convert error>\n";
+        return;
+    }
+
+    // UTC SYSTEMTIME -> local SYSTEMTIME (важно для “как в проводнике”)
+    FILETIME localFt{};
+    if (!SystemTimeToFileTime(&utc, &localFt)) {
+        std::wcout << label << L": <convert error>\n";
+        return;
+    }
+    if (!FileTimeToLocalFileTime(&ft, &localFt)) {
+        // fallback: просто печатаем UTC
+        std::wcout << label << L" (UTC): "
+                   << utc.wDay << L"." << utc.wMonth << L"." << utc.wYear << L" "
+                   << utc.wHour << L":" << utc.wMinute << L":" << utc.wSecond << L"\n";
+        return;
+    }
+    if (!FileTimeToSystemTime(&localFt, &local)) {
+        std::wcout << label << L": <convert error>\n";
+        return;
+    }
+
+    std::wcout << label << L" (local): "
+               << local.wDay << L"." << local.wMonth << L"." << local.wYear << L" "
+               << local.wHour << L":" << local.wMinute << L":" << local.wSecond << L"\n";
+}
+
 // -------------------------- 15) GetFileTime --------------------------
 
 static void Cmd_GetFileTime() {
@@ -325,8 +350,15 @@ static void Cmd_GetFileTime() {
 
     FILETIME c{}, a{}, w{};
     BOOL ok = GetFileTime(h, &c, &a, &w);
-    if (!ok) std::wcerr << L"GetFileTime failed: " << LastErrorMsg() << L"\n";
-    else std::wcout << L"OK (FILETIME values fetched)\n";
+    if (!ok) {
+        std::wcerr << L"GetFileTime failed: " << LastErrorMsg() << L"\n";
+        CloseHandle(h);
+        return;
+    }
+
+    PrintFileTime(L"Creation time", c);
+    PrintFileTime(L"Last access  ", a);
+    PrintFileTime(L"Last write   ", w);
 
     CloseHandle(h);
 }
@@ -336,22 +368,46 @@ static void Cmd_GetFileTime() {
 static void Cmd_SetFileTime() {
     std::wstring path = ReadLine(L"Enter file path: ");
 
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         std::wcerr << L"CreateFileW(open) failed: " << LastErrorMsg() << L"\n";
         return;
     }
 
+    FILETIME c0{}, a0{}, w0{};
+    if (!GetFileTime(h, &c0, &a0, &w0)) {
+        std::wcerr << L"GetFileTime(before) failed: " << LastErrorMsg() << L"\n";
+        CloseHandle(h);
+        return;
+    }
+
+    std::wcout << L"Before:\n";
+    PrintFileTime(L"Last write", w0);
+
+    // Берём текущее системное время (UTC) и ставим его как LastWriteTime
     SYSTEMTIME st{};
     GetSystemTime(&st);
 
-    FILETIME ft{};
-    SystemTimeToFileTime(&st, &ft);
+    FILETIME ftNow{};
+    SystemTimeToFileTime(&st, &ftNow);
 
-    BOOL ok = SetFileTime(h, nullptr, nullptr, &ft);
-    if (!ok) std::wcerr << L"SetFileTime failed: " << LastErrorMsg() << L"\n";
-    else std::wcout << L"OK (LastWriteTime updated)\n";
+    BOOL ok = SetFileTime(h, nullptr, nullptr, &ftNow);
+    if (!ok) {
+        std::wcerr << L"SetFileTime failed: " << LastErrorMsg() << L"\n";
+        CloseHandle(h);
+        return;
+    }
+
+    FILETIME c1{}, a1{}, w1{};
+    if (!GetFileTime(h, &c1, &a1, &w1)) {
+        std::wcerr << L"GetFileTime(after) failed: " << LastErrorMsg() << L"\n";
+        CloseHandle(h);
+        return;
+    }
+
+    std::wcout << L"After:\n";
+    PrintFileTime(L"Last write", w1);
 
     CloseHandle(h);
 }
@@ -367,7 +423,7 @@ static int Menu() {
                << L" 5) GetDiskFreeSpaceExW\n"
                << L" 6) CreateDirectoryW\n"
                << L" 7) RemoveDirectoryW\n"
-               << L" 8) CreateFileW (+ WriteFile)\n"
+               << L" 8) CreateFileW\n"
                << L" 9) CopyFileW\n"
                << L"10) MoveFileW\n"
                << L"11) MoveFileExW\n"
