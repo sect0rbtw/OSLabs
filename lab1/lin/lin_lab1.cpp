@@ -18,27 +18,9 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <signal.h>
 #include <stdint.h>
 #include <inttypes.h>
-
-// ---- “замена time.h” ----
-typedef long time_t;
-struct timespec { time_t tv_sec; long tv_nsec; };
-
-#ifndef CLOCK_MONOTONIC
-#define CLOCK_MONOTONIC 1
-#endif
-
-extern int clock_gettime(int clk_id, struct timespec *tp);
-
-// ---- “атомарность” без <atomic> (GCC/Clang builtins) ----
-static inline int64_t atomic_add64(volatile int64_t* p, int64_t v) {
-    return __sync_add_and_fetch(p, v);
-}
-static inline int64_t atomic_load64(volatile int64_t* p) {
-    return __sync_add_and_fetch(p, 0);
-}
+#include <time.h>
 
 // ===== CLR + pause =====
 static void clr() {
@@ -66,6 +48,14 @@ static void read_line(const char* prompt, char* out, size_t out_sz) {
         return;
     }
     out[strcspn(out, "\n")] = 0;
+}
+
+// ---- “атомарность” без <atomic> ----
+static inline int64_t atomic_add64(volatile int64_t* p, int64_t v) {
+    return __sync_add_and_fetch(p, v);
+}
+static inline int64_t atomic_load64(volatile int64_t* p) {
+    return __sync_add_and_fetch(p, 0);
 }
 
 struct aio_operation {
@@ -134,16 +124,13 @@ static void aio_completion_handler(sigval_t sigval) {
     if (aio_op->write_operation) {
         // write completed
         int64_t newTotal = atomic_add64(&g_total_written64, (int64_t)ret);
-        if (newTotal >= (int64_t)g_file_size) {
-            g_done = 1;
-        }
+        if (newTotal >= (int64_t)g_file_size) g_done = 1;
         g_pending--;
         return;
     }
 
     // read completed -> start write
     if (ret == 0) {
-        // EOF (на всякий случай)
         g_pending--;
         return;
     }
@@ -168,8 +155,7 @@ static void aio_completion_handler(sigval_t sigval) {
         g_pending--;
         return;
     }
-
-    // pending не уменьшаем: read “перешёл” в write (одна операция в полёте)
+    // pending не уменьшаем: read “перешёл” в write
 }
 
 // ===== submit read =====
@@ -270,7 +256,6 @@ static void cmd_copy() {
     g_ops = (struct aio_operation*)calloc((size_t)g_ops_count, sizeof(struct aio_operation));
     if (!g_ops) { printf("calloc ops failed\n"); return; }
 
-    // буфер нужен только для READ (WRITE использует тот же)
     for (int i = 0; i < g_inflight; ++i) {
         struct aio_operation* r = &g_ops[i*2 + 0];
         r->buffer = (char*)malloc(g_block_size);
@@ -287,7 +272,6 @@ static void cmd_copy() {
     g_next_offset = 0;
     g_total_written64 = 0;
 
-    // первичная заливка чтений
     for (int i = 0; i < g_inflight; ++i) {
         struct aio_operation* r = &g_ops[i*2 + 0];
         struct aio_operation* w = &g_ops[i*2 + 1];
@@ -300,17 +284,15 @@ static void cmd_copy() {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    // Главный цикл: ждём только активные операции
     while (!g_done && !g_error) {
+        // aio_suspend: ждём только активные операции
         int activeCount = 0;
         const struct aiocb** activeList =
             (const struct aiocb**)alloca((size_t)g_ops_count * sizeof(struct aiocb*));
 
         for (int i = 0; i < g_ops_count; ++i) {
             int e = aio_error(&g_ops[i].aio);
-            if (e == EINPROGRESS) {
-                activeList[activeCount++] = &g_ops[i].aio;
-            }
+            if (e == EINPROGRESS) activeList[activeCount++] = &g_ops[i].aio;
         }
 
         if (activeCount > 0) {
@@ -321,7 +303,6 @@ static void cmd_copy() {
                 break;
             }
         } else {
-            // активных операций нет — проверим прогресс и чуть подождём
             if (atomic_load64(&g_total_written64) >= (int64_t)g_file_size) {
                 g_done = 1;
                 break;
@@ -329,7 +310,7 @@ static void cmd_copy() {
             usleep(1000);
         }
 
-        // дозапуск чтений в освободившиеся слоты
+        // дозапуск чтений в свободные слоты
         for (int i = 0; i < g_inflight && g_next_offset < g_file_size && !g_error; ++i) {
             struct aio_operation* r = &g_ops[i*2 + 0];
             struct aio_operation* w = &g_ops[i*2 + 1];
@@ -356,7 +337,6 @@ static void cmd_copy() {
             int e = aio_error(&g_ops[i].aio);
             if (e == EINPROGRESS) activeList[activeCount++] = &g_ops[i].aio;
         }
-
         if (activeCount == 0) break;
         aio_suspend(activeList, activeCount, NULL);
     }
@@ -378,7 +358,6 @@ static void cmd_copy() {
     fflush(stdout);
 }
 
-// ===== меню =====
 static int menu() {
     printf("\n=== Linux Task2 AIO Menu (split) ===\n");
     printf(" 1) Set paths (src/dst)\n");
