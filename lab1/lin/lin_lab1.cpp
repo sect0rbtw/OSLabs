@@ -74,7 +74,7 @@ static size_t g_block_size = 4096;
 static int    g_inflight = 2;
 
 static volatile sig_atomic_t g_done = 0;
-static volatile sig_atomic_t g_pending = 0;
+static volatile int64_t g_pending64 = 0;
 static volatile sig_atomic_t g_error = 0;
 
 static off_t g_next_offset = 0;
@@ -110,14 +110,14 @@ static void aio_completion_handler(sigval_t sigval) {
     int err = aio_error(&aio_op->aio);
     if (err != 0) {
         if (err != EINPROGRESS) g_error = 1;
-        g_pending--;
+        atomic_add64(&g_pending64, -1);
         return;
     }
 
     ssize_t ret = aio_return(&aio_op->aio);
     if (ret < 0) {
         g_error = 1;
-        g_pending--;
+        atomic_add64(&g_pending64, -1);
         return;
     }
 
@@ -125,13 +125,13 @@ static void aio_completion_handler(sigval_t sigval) {
         // write completed
         int64_t newTotal = atomic_add64(&g_total_written64, (int64_t)ret);
         if (newTotal >= (int64_t)g_file_size) g_done = 1;
-        g_pending--;
+        atomic_add64(&g_pending64, -1);
         return;
     }
 
     // read completed -> start write
     if (ret == 0) {
-        g_pending--;
+        atomic_add64(&g_pending64, -1);
         return;
     }
 
@@ -152,7 +152,7 @@ static void aio_completion_handler(sigval_t sigval) {
 
     if (aio_write(&write_op->aio) != 0) {
         g_error = 1;
-        g_pending--;
+        atomic_add64(&g_pending64, -1);
         return;
     }
     // pending не уменьшаем: read “перешёл” в write
@@ -184,7 +184,7 @@ static int submit_read(struct aio_operation* read_op, struct aio_operation* writ
         return -1;
     }
 
-    g_pending++;
+    atomic_add64(&g_pending64, 1);
     return 1;
 }
 
@@ -268,7 +268,7 @@ static void cmd_copy() {
 
     g_done = 0;
     g_error = 0;
-    g_pending = 0;
+    g_pending64 = 0;
     g_next_offset = 0;
     g_total_written64 = 0;
 
@@ -303,7 +303,7 @@ static void cmd_copy() {
                 break;
             }
         } else {
-            if (atomic_load64(&g_total_written64) >= (int64_t)g_file_size) {
+            if (g_next_offset >= g_file_size && atomic_load64(&g_pending64) == 0) {
                 g_done = 1;
                 break;
             }
@@ -328,7 +328,7 @@ static void cmd_copy() {
     }
 
     // дождаться хвоста
-    while (g_pending > 0 && !g_error) {
+    while (atomic_load64(&g_pending64) > 0 && !g_error) {
         int activeCount = 0;
         const struct aiocb** activeList =
             (const struct aiocb**)alloca((size_t)g_ops_count * sizeof(struct aiocb*));
