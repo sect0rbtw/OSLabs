@@ -32,6 +32,28 @@ static void PauseEnter() {
     std::getline(std::wcin, tmp);
 }
 
+static void PrintFsFlags(DWORD fsFlags) {
+    auto yn = [&](DWORD bit) { return (fsFlags & bit) ? L"YES" : L"NO"; };
+
+    std::wcout << L"\n--- File system capabilities (fsFlags) ---\n";
+    std::wcout << L"Case sensitive search       : " << yn(FILE_CASE_SENSITIVE_SEARCH) << L"\n";
+    std::wcout << L"Preserves case of names     : " << yn(FILE_CASE_PRESERVED_NAMES) << L"\n";
+    std::wcout << L"Unicode on disk             : " << yn(FILE_UNICODE_ON_DISK) << L"\n";
+    std::wcout << L"Persistent ACLs (permissions): " << yn(FILE_PERSISTENT_ACLS) << L"\n";
+    std::wcout << L"File compression supported  : " << yn(FILE_FILE_COMPRESSION) << L"\n";
+    std::wcout << L"Volume supports compression : " << yn(FILE_VOLUME_IS_COMPRESSED) << L"\n";
+    std::wcout << L"Encryption supported (EFS)  : " << yn(FILE_SUPPORTS_ENCRYPTION) << L"\n";
+    std::wcout << L"Reparse points supported    : " << yn(FILE_SUPPORTS_REPARSE_POINTS) << L"\n";
+    std::wcout << L"Sparse files supported      : " << yn(FILE_SUPPORTS_SPARSE_FILES) << L"\n";
+    std::wcout << L"Hard links supported        : " << yn(FILE_SUPPORTS_HARD_LINKS) << L"\n";
+    std::wcout << L"Named streams supported     : " << yn(FILE_NAMED_STREAMS) << L"\n";
+    std::wcout << L"Object IDs supported        : " << yn(FILE_SUPPORTS_OBJECT_IDS) << L"\n";
+    std::wcout << L"USN Journal supported       : " << yn(FILE_SUPPORTS_USN_JOURNAL) << L"\n";
+    std::wcout << L"Extended attributes supported: " << yn(FILE_SUPPORTS_EXTENDED_ATTRIBUTES) << L"\n";
+    std::wcout << L"Transactions supported (TxF): " << yn(FILE_SUPPORTS_TRANSACTIONS) << L"\n";
+    std::wcout << L"\n";
+}
+
 // ===============================================================
 
 static std::wstring LastErrorMsg(DWORD err = GetLastError()) {
@@ -136,11 +158,15 @@ static void Cmd_GetVolumeInformation() {
         return;
     }
 
+    std::wcout << L"Volume root : " << root << L"\n";
     std::wcout << L"Volume label: " << volName << L"\n";
     std::wcout << L"File system : " << fsName << L"\n";
     std::wcout << L"Serial      : 0x" << std::hex << serial << std::dec << L"\n";
     std::wcout << L"Max name len: " << maxCompLen << L"\n";
     std::wcout << L"FS flags    : 0x" << std::hex << fsFlags << std::dec << L"\n";
+
+    // Расшифровка возможностей
+    PrintFsFlags(fsFlags);
 }
 
 // ---------------------- 5) GetDiskFreeSpaceEx ------------------------
@@ -415,7 +441,7 @@ static void Cmd_SetFileTime() {
 // ------------------------------ Menu --------------------------------
 
 static int Menu() {
-    std::wcout << L"\n=== Win32 FS Menu (split) ===\n"
+    std::wcout << L"\n=== Win32 FS Menu ===\n"
                << L" 1) GetLogicalDrives\n"
                << L" 2) GetLogicalDriveStringsW\n"
                << L" 3) GetDriveTypeW\n"
