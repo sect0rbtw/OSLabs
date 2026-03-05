@@ -1,3 +1,9 @@
+// lab1.cpp
+// Build:
+//   g++ -std=c++17 -O2 lab1.cpp -o aio_menu -pthread
+// Run:
+//   ./aio_menu
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -15,11 +21,6 @@
 #include <signal.h>
 #include <stdint.h>
 #include <inttypes.h>
-
-/*
-    Методичка требует набор библиотек именно отсюда.
-    Поэтому <time.h> подключать нельзя — объявим нужное вручную.
-*/
 
 // ---- “замена time.h” ----
 typedef long time_t;
