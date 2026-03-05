@@ -1,10 +1,7 @@
-// linux_task2_aio_menu.cpp
-// Build:
-//   g++ -std=c++17 -O2 linux_task2_aio_menu.cpp -o aio_menu -pthread
-// Run:
-//   ./aio_menu
-
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <aio.h>
@@ -18,11 +15,32 @@
 #include <signal.h>
 #include <stdint.h>
 #include <inttypes.h>
-#include <time.h>
 
-// ====== CLR + pause (как на Win, только для Linux терминала) ======
+/*
+    Методичка требует набор библиотек именно отсюда.
+    Поэтому <time.h> подключать нельзя — объявим нужное вручную.
+*/
+
+// ---- “замена time.h” ----
+typedef long time_t;
+struct timespec { time_t tv_sec; long tv_nsec; };
+
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
+#endif
+
+extern int clock_gettime(int clk_id, struct timespec *tp);
+
+// ---- “атомарность” без <atomic> (GCC/Clang builtins) ----
+static inline int64_t atomic_add64(volatile int64_t* p, int64_t v) {
+    return __sync_add_and_fetch(p, v);
+}
+static inline int64_t atomic_load64(volatile int64_t* p) {
+    return __sync_add_and_fetch(p, 0);
+}
+
+// ===== CLR + pause =====
 static void clr() {
-    // ANSI escape: clear screen + cursor home
     printf("\033[2J\033[H");
     fflush(stdout);
 }
@@ -30,46 +48,54 @@ static void pause_enter() {
     printf("\nPress Enter to continue...");
     fflush(stdout);
     int c;
-    // дочитать до '\n'
     do { c = getchar(); } while (c != '\n' && c != EOF);
 }
-// ==================================================================
+
+// ===== утилиты =====
+static void print_errno(const char* where) {
+    fprintf(stderr, "%s failed: %s\n", where, strerror(errno));
+    fflush(stderr);
+}
+
+static void read_line(const char* prompt, char* out, size_t out_sz) {
+    printf("%s", prompt);
+    fflush(stdout);
+    if (!fgets(out, (int)out_sz, stdin)) {
+        out[0] = 0;
+        return;
+    }
+    out[strcspn(out, "\n")] = 0;
+}
 
 struct aio_operation {
     struct aiocb aio;
     char *buffer;
-    int write_operation;      // 0 = read, 1 = write
-    void* next_operation;     // обычно: read -> write
+    int write_operation;   // 0=read, 1=write
+    void* next_operation;  // read->write
 };
 
-// --------- Глобальное состояние (упрощает handler) ----------
+// ===== глобальное состояние =====
 static int g_fd_in  = -1;
 static int g_fd_out = -1;
 
 static off_t  g_file_size = 0;
 static size_t g_block_size = 4096;
-static int    g_inflight = 4;
+static int    g_inflight = 2;
 
 static volatile sig_atomic_t g_done = 0;
-static volatile sig_atomic_t g_pending = 0;      // сколько операций "в полёте"
+static volatile sig_atomic_t g_pending = 0;
 static volatile sig_atomic_t g_error = 0;
 
 static off_t g_next_offset = 0;
-static off_t g_total_written = 0;
+static volatile int64_t g_total_written64 = 0;
 
-// массив операций (пары read+write)
+static char g_src[1024] = {0};
+static char g_dst[1024] = {0};
+
 static struct aio_operation* g_ops = NULL;
 static int g_ops_count = 0;
 
-// Для aio_suspend — список активных aiocb*
-static const struct aiocb** g_suspend_list = NULL;
-static int g_suspend_count = 0;
-
-// ---------- Утилиты ----------
-static void print_errno(const char* where) {
-    fprintf(stderr, "%s failed: %s\n", where, strerror(errno));
-}
-
+// ===== освобождение =====
 static void close_all() {
     if (g_fd_in != -1)  { close(g_fd_in);  g_fd_in  = -1; }
     if (g_fd_out != -1) { close(g_fd_out); g_fd_out = -1; }
@@ -81,29 +107,22 @@ static void free_ops() {
         if (g_ops[i].buffer) free(g_ops[i].buffer);
         g_ops[i].buffer = NULL;
     }
-    free(g_ops); g_ops = NULL;
+    free(g_ops);
+    g_ops = NULL;
     g_ops_count = 0;
-
-    if (g_suspend_list) { free((void*)g_suspend_list); g_suspend_list = NULL; }
-    g_suspend_count = 0;
 }
 
-// ---------- Completion handler (как в PDF) ----------
+// ===== completion handler (SIGEV_THREAD) =====
 static void aio_completion_handler(sigval_t sigval) {
     struct aio_operation *aio_op = (struct aio_operation *)sigval.sival_ptr;
 
-    // Проверим статус операции
     int err = aio_error(&aio_op->aio);
     if (err != 0) {
-        // EINPROGRESS тут быть не должен (handler вызывается по завершению),
-        // но если будет — просто выходим
-        if (err == EINPROGRESS) return;
-        g_error = 1;
+        if (err != EINPROGRESS) g_error = 1;
         g_pending--;
         return;
     }
 
-    // Сколько реально передано
     ssize_t ret = aio_return(&aio_op->aio);
     if (ret < 0) {
         g_error = 1;
@@ -112,56 +131,47 @@ static void aio_completion_handler(sigval_t sigval) {
     }
 
     if (aio_op->write_operation) {
-        // ----- операция записи завершилась -----
-        g_total_written += (off_t)ret;
-
-        // Если всё записали — сигнал "готово"
-        if (g_total_written >= g_file_size) {
+        // write completed
+        int64_t newTotal = atomic_add64(&g_total_written64, (int64_t)ret);
+        if (newTotal >= (int64_t)g_file_size) {
             g_done = 1;
         }
-
-        // Освобождаем "слот": после write можно снова запускать read
         g_pending--;
-
-    } else {
-        // ----- операция чтения завершилась -----
-        if (ret == 0) {
-            // EOF — на всякий случай
-            g_pending--;
-            return;
-        }
-
-        // По шаблону: у read есть next_operation = write
-        struct aio_operation* write_op = (struct aio_operation*)aio_op->next_operation;
-
-        // Заполняем write_op на те же offset/буфер/ret байт
-        memset(&write_op->aio, 0, sizeof(write_op->aio));
-        write_op->write_operation = 1;
-
-        write_op->aio.aio_fildes  = g_fd_out;
-        write_op->aio.aio_buf     = aio_op->buffer;
-        write_op->aio.aio_nbytes  = (size_t)ret;
-        write_op->aio.aio_offset  = aio_op->aio.aio_offset;
-
-        // Включаем SIGEV_THREAD, чтобы по завершению вызвался handler
-        write_op->aio.aio_sigevent.sigev_notify = SIGEV_THREAD;
-        write_op->aio.aio_sigevent.sigev_notify_function = aio_completion_handler;
-        write_op->aio.aio_sigevent.sigev_value.sival_ptr = write_op;
-        write_op->aio.aio_sigevent.sigev_notify_attributes = NULL;
-
-        // Запуск записи
-        if (aio_write(&write_op->aio) != 0) {
-            g_error = 1;
-            g_pending--;
-            return;
-        }
-
-        // Важно: pending не уменьшаем, потому что read "превратился" в write
-        // (в полёте всё ещё одна операция)
+        return;
     }
+
+    // read completed -> start write
+    if (ret == 0) {
+        // EOF (на всякий случай)
+        g_pending--;
+        return;
+    }
+
+    struct aio_operation* write_op = (struct aio_operation*)aio_op->next_operation;
+
+    memset(&write_op->aio, 0, sizeof(write_op->aio));
+    write_op->write_operation = 1;
+
+    write_op->aio.aio_fildes  = g_fd_out;
+    write_op->aio.aio_buf     = aio_op->buffer;
+    write_op->aio.aio_nbytes  = (size_t)ret;
+    write_op->aio.aio_offset  = aio_op->aio.aio_offset;
+
+    write_op->aio.aio_sigevent.sigev_notify = SIGEV_THREAD;
+    write_op->aio.aio_sigevent.sigev_notify_function = aio_completion_handler;
+    write_op->aio.aio_sigevent.sigev_value.sival_ptr = write_op;
+    write_op->aio.aio_sigevent.sigev_notify_attributes = NULL;
+
+    if (aio_write(&write_op->aio) != 0) {
+        g_error = 1;
+        g_pending--;
+        return;
+    }
+
+    // pending не уменьшаем: read “перешёл” в write (одна операция в полёте)
 }
 
-// ---------- Запуск одной READ операции в свободном "слоте" ----------
+// ===== submit read =====
 static int submit_read(struct aio_operation* read_op, struct aio_operation* write_op, off_t off) {
     if (off >= g_file_size) return 0;
 
@@ -177,7 +187,6 @@ static int submit_read(struct aio_operation* read_op, struct aio_operation* writ
     read_op->aio.aio_nbytes  = need;
     read_op->aio.aio_offset  = off;
 
-    // SIGEV_THREAD -> по завершению aio_read вызовется handler
     read_op->aio.aio_sigevent.sigev_notify = SIGEV_THREAD;
     read_op->aio.aio_sigevent.sigev_notify_function = aio_completion_handler;
     read_op->aio.aio_sigevent.sigev_value.sival_ptr = read_op;
@@ -192,156 +201,10 @@ static int submit_read(struct aio_operation* read_op, struct aio_operation* writ
     return 1;
 }
 
-// ---------- Команда: AIO COPY (с aio_suspend как в требованиях) ----------
-static void do_aio_copy() {
-    if (g_fd_in < 0 || g_fd_out < 0) {
-        printf("Open src and dst first.\n");
-        return;
-    }
-    if (g_file_size <= 0) {
-        printf("Run fstat first (file size must be > 0).\n");
-        return;
-    }
-
-    // Подготовить пары операций: inflight * (read+write)
-    free_ops();
-    g_ops_count = g_inflight * 2;
-    g_ops = (struct aio_operation*)calloc((size_t)g_ops_count, sizeof(struct aio_operation));
-    if (!g_ops) {
-        printf("calloc ops failed.\n");
-        return;
-    }
-
-    // Выделим буфер для каждого READ (WRITE использует тот же буфер)
-    for (int i = 0; i < g_inflight; ++i) {
-        struct aio_operation* r = &g_ops[i*2 + 0];
-        struct aio_operation* w = &g_ops[i*2 + 1];
-        (void)w; // w буфер не нужен
-
-        r->buffer = (char*)malloc(g_block_size);
-        if (!r->buffer) {
-            printf("malloc buffer failed.\n");
-            free_ops();
-            return;
-        }
-    }
-
-    // Для aio_suspend сделаем список указателей на aiocb (на все операции)
-    g_suspend_count = g_ops_count;
-    g_suspend_list = (const struct aiocb**)calloc((size_t)g_suspend_count, sizeof(struct aiocb*));
-    if (!g_suspend_list) {
-        printf("calloc suspend list failed.\n");
-        free_ops();
-        return;
-    }
-    for (int i = 0; i < g_ops_count; ++i) g_suspend_list[i] = &g_ops[i].aio;
-
-    // Сброс состояния копирования
-    g_done = 0;
-    g_error = 0;
-    g_pending = 0;
-    g_next_offset = 0;
-    g_total_written = 0;
-
-    // Первичная заливка N чтений
-    for (int i = 0; i < g_inflight; ++i) {
-        struct aio_operation* r = &g_ops[i*2 + 0];
-        struct aio_operation* w = &g_ops[i*2 + 1];
-
-        int rc = submit_read(r, w, g_next_offset);
-        if (rc < 0) { g_error = 1; break; }
-        if (rc == 0) break;
-
-        g_next_offset += (off_t)g_block_size;
-    }
-
-    // Засечём время (простая оценка)
-    struct timespec t0{}, t1{};
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-
-    // Главный цикл:
-    // - ждём завершения хотя бы одной операции через aio_suspend (как требуют)
-    // - после завершения write освобождается слот (pending уменьшается),
-    //   значит можно запускать новый read в этот же слот
-    while (!g_done && !g_error) {
-        // Требование: aio_suspend должен быть использован
-        // Мы делаем неблокирующее ожидание с таймаутом, чтобы периодически дозапускать чтения.
-        struct timespec timeout{};
-        timeout.tv_sec = 0;
-        timeout.tv_nsec = 200 * 1000 * 1000; // 200ms
-
-        int s = aio_suspend(g_suspend_list, g_suspend_count, &timeout);
-        if (s != 0 && errno != EINTR && errno != EAGAIN) {
-            print_errno("aio_suspend");
-            g_error = 1;
-            break;
-        }
-
-        // Дозапуск чтений: если есть что читать и есть "свободные слоты".
-        // Свободный слот определяем так: read_op не выполняется (aio_error != EINPROGRESS)
-        // и write_op не выполняется.
-        for (int i = 0; i < g_inflight && g_next_offset < g_file_size && !g_error; ++i) {
-            struct aio_operation* r = &g_ops[i*2 + 0];
-            struct aio_operation* w = &g_ops[i*2 + 1];
-
-            int er = aio_error(&r->aio);
-            int ew = aio_error(&w->aio);
-
-            int r_busy = (er == EINPROGRESS);
-            int w_busy = (ew == EINPROGRESS);
-
-            if (!r_busy && !w_busy) {
-                int rc = submit_read(r, w, g_next_offset);
-                if (rc < 0) { g_error = 1; break; }
-                if (rc == 0) break;
-                g_next_offset += (off_t)g_block_size;
-            }
-        }
-
-        // Лайфхак из пояснений: можно ловить конец копирования через sleep/raise,
-        // но мы тут делаем аккуратно через флаг g_done. :contentReference[oaicite:1]{index=1}
-    }
-
-    // Дождёмся пока "в полёте" закончатся операции, чтобы корректно завершить
-    // (handler в отдельных потоках)
-    while (g_pending > 0 && !g_error) {
-        struct timespec timeout{};
-        timeout.tv_sec = 0;
-        timeout.tv_nsec = 200 * 1000 * 1000;
-        aio_suspend(g_suspend_list, g_suspend_count, &timeout);
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-
-    double sec = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec)/1e9;
-    if (sec < 1e-9) sec = 1e-9;
-
-    double mb = (double)g_file_size / (1024.0 * 1024.0);
-    double speed = mb / sec;
-
-    if (g_error) {
-        printf("COPY FAILED (see errors above).\n");
-    } else {
-        printf("Copied %" PRIdMAX " bytes in %.6f sec => %.3f MiB/s\n",
-               (intmax_t)g_file_size, sec, speed);
-    }
-}
-
-// ---------- Меню-команды (разделены) ----------
-static char g_src[1024] = {0};
-static char g_dst[1024] = {0};
-
+// ===== команды меню (разделены) =====
 static void cmd_set_paths() {
-    printf("Enter source path: ");
-    fflush(stdout);
-    fgets(g_src, sizeof(g_src), stdin);
-    g_src[strcspn(g_src, "\n")] = 0;
-
-    printf("Enter destination path: ");
-    fflush(stdout);
-    fgets(g_dst, sizeof(g_dst), stdin);
-    g_dst[strcspn(g_dst, "\n")] = 0;
-
+    read_line("Enter source path: ", g_src, sizeof(g_src));
+    read_line("Enter destination path: ", g_dst, sizeof(g_dst));
     printf("OK\n");
 }
 
@@ -349,7 +212,6 @@ static void cmd_open_src() {
     if (g_fd_in != -1) { printf("src already open\n"); return; }
     if (g_src[0] == 0) { printf("set paths first\n"); return; }
 
-    // как в пояснениях: O_RDONLY | O_NONBLOCK :contentReference[oaicite:2]{index=2}
     g_fd_in = open(g_src, O_RDONLY | O_NONBLOCK, 0666);
     if (g_fd_in < 0) { print_errno("open(src)"); g_fd_in = -1; return; }
     printf("open(src) OK fd=%d\n", g_fd_in);
@@ -359,15 +221,14 @@ static void cmd_open_dst() {
     if (g_fd_out != -1) { printf("dst already open\n"); return; }
     if (g_dst[0] == 0) { printf("set paths first\n"); return; }
 
-    // как в пояснениях: O_CREAT|O_WRONLY|O_TRUNC|O_NONBLOCK :contentReference[oaicite:3]{index=3}
     g_fd_out = open(g_dst, O_CREAT | O_WRONLY | O_TRUNC | O_NONBLOCK, 0666);
     if (g_fd_out < 0) { print_errno("open(dst)"); g_fd_out = -1; return; }
     printf("open(dst) OK fd=%d\n", g_fd_out);
 }
 
-static void cmd_fstat() {
+static void cmd_fstat_src() {
     if (g_fd_in < 0) { printf("open src first\n"); return; }
-    struct stat sb{};
+    struct stat sb;
     if (fstat(g_fd_in, &sb) != 0) { print_errno("fstat"); return; }
     g_file_size = sb.st_size;
     printf("fstat OK, file size = %" PRIdMAX " bytes\n", (intmax_t)g_file_size);
@@ -375,9 +236,7 @@ static void cmd_fstat() {
 
 static void cmd_set_block() {
     char tmp[64];
-    printf("Enter block size (bytes): ");
-    fflush(stdout);
-    fgets(tmp, sizeof(tmp), stdin);
+    read_line("Enter block size (bytes): ", tmp, sizeof(tmp));
     size_t v = (size_t)strtoull(tmp, NULL, 10);
     if (v == 0) v = 1;
     g_block_size = v;
@@ -386,21 +245,139 @@ static void cmd_set_block() {
 
 static void cmd_set_inflight() {
     char tmp[64];
-    printf("Enter inflight (1,2,4,8,12,16...): ");
-    fflush(stdout);
-    fgets(tmp, sizeof(tmp), stdin);
+    read_line("Enter inflight (1,2,4,8...): ", tmp, sizeof(tmp));
     int v = atoi(tmp);
     if (v < 1) v = 1;
     g_inflight = v;
     printf("inflight = %d\n", g_inflight);
 }
 
-static void cmd_close_all() {
+static void cmd_close_free() {
     close_all();
     free_ops();
     printf("closed + freed\n");
 }
 
+// ===== основной пункт: Copy =====
+static void cmd_copy() {
+    if (g_fd_in < 0 || g_fd_out < 0) { printf("open src and dst first\n"); return; }
+    if (g_file_size <= 0) { printf("run fstat first (file size must be > 0)\n"); return; }
+
+    free_ops();
+
+    g_ops_count = g_inflight * 2;
+    g_ops = (struct aio_operation*)calloc((size_t)g_ops_count, sizeof(struct aio_operation));
+    if (!g_ops) { printf("calloc ops failed\n"); return; }
+
+    // буфер нужен только для READ (WRITE использует тот же)
+    for (int i = 0; i < g_inflight; ++i) {
+        struct aio_operation* r = &g_ops[i*2 + 0];
+        r->buffer = (char*)malloc(g_block_size);
+        if (!r->buffer) {
+            printf("malloc buffer failed\n");
+            free_ops();
+            return;
+        }
+    }
+
+    g_done = 0;
+    g_error = 0;
+    g_pending = 0;
+    g_next_offset = 0;
+    g_total_written64 = 0;
+
+    // первичная заливка чтений
+    for (int i = 0; i < g_inflight; ++i) {
+        struct aio_operation* r = &g_ops[i*2 + 0];
+        struct aio_operation* w = &g_ops[i*2 + 1];
+        int rc = submit_read(r, w, g_next_offset);
+        if (rc < 0) { g_error = 1; break; }
+        if (rc == 0) break;
+        g_next_offset += (off_t)g_block_size;
+    }
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    // Главный цикл: ждём только активные операции
+    while (!g_done && !g_error) {
+        int activeCount = 0;
+        const struct aiocb** activeList =
+            (const struct aiocb**)alloca((size_t)g_ops_count * sizeof(struct aiocb*));
+
+        for (int i = 0; i < g_ops_count; ++i) {
+            int e = aio_error(&g_ops[i].aio);
+            if (e == EINPROGRESS) {
+                activeList[activeCount++] = &g_ops[i].aio;
+            }
+        }
+
+        if (activeCount > 0) {
+            int s = aio_suspend(activeList, activeCount, NULL);
+            if (s != 0 && errno != EINTR) {
+                print_errno("aio_suspend");
+                g_error = 1;
+                break;
+            }
+        } else {
+            // активных операций нет — проверим прогресс и чуть подождём
+            if (atomic_load64(&g_total_written64) >= (int64_t)g_file_size) {
+                g_done = 1;
+                break;
+            }
+            usleep(1000);
+        }
+
+        // дозапуск чтений в освободившиеся слоты
+        for (int i = 0; i < g_inflight && g_next_offset < g_file_size && !g_error; ++i) {
+            struct aio_operation* r = &g_ops[i*2 + 0];
+            struct aio_operation* w = &g_ops[i*2 + 1];
+
+            int er = aio_error(&r->aio);
+            int ew = aio_error(&w->aio);
+
+            if (er != EINPROGRESS && ew != EINPROGRESS) {
+                int rc = submit_read(r, w, g_next_offset);
+                if (rc < 0) { g_error = 1; break; }
+                if (rc == 0) break;
+                g_next_offset += (off_t)g_block_size;
+            }
+        }
+    }
+
+    // дождаться хвоста
+    while (g_pending > 0 && !g_error) {
+        int activeCount = 0;
+        const struct aiocb** activeList =
+            (const struct aiocb**)alloca((size_t)g_ops_count * sizeof(struct aiocb*));
+
+        for (int i = 0; i < g_ops_count; ++i) {
+            int e = aio_error(&g_ops[i].aio);
+            if (e == EINPROGRESS) activeList[activeCount++] = &g_ops[i].aio;
+        }
+
+        if (activeCount == 0) break;
+        aio_suspend(activeList, activeCount, NULL);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    double sec = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+    if (sec < 1e-9) sec = 1e-9;
+
+    double mib = (double)g_file_size / (1024.0 * 1024.0);
+    double speed = mib / sec;
+
+    if (g_error) {
+        printf("COPY FAILED (see errors above)\n");
+    } else {
+        printf("Copied %" PRIdMAX " bytes in %.6f sec => %.3f MiB/s\n",
+               (intmax_t)g_file_size, sec, speed);
+    }
+    fflush(stdout);
+}
+
+// ===== меню =====
 static int menu() {
     printf("\n=== Linux Task2 AIO Menu (split) ===\n");
     printf(" 1) Set paths (src/dst)\n");
@@ -424,22 +401,21 @@ int main() {
     for (;;) {
         int c = menu();
         if (c == 0) {
-            cmd_close_all();
+            cmd_close_free();
             return 0;
         }
 
-        // CLR перед каждой новой командой (как ты делал на Win)
         clr();
 
         switch (c) {
             case 1: cmd_set_paths(); break;
             case 2: cmd_open_src(); break;
             case 3: cmd_open_dst(); break;
-            case 4: cmd_fstat(); break;
+            case 4: cmd_fstat_src(); break;
             case 5: cmd_set_block(); break;
             case 6: cmd_set_inflight(); break;
-            case 7: do_aio_copy(); break;
-            case 8: cmd_close_all(); break;
+            case 7: cmd_copy(); break;
+            case 8: cmd_close_free(); break;
             default: printf("Unknown option\n"); break;
         }
 
