@@ -232,7 +232,7 @@ static void cmd_set_block() {
 
 static void cmd_set_inflight() {
     char tmp[64];
-    read_line("Enter inflight (1,2,4,8...): ", tmp, sizeof(tmp));
+    read_line("Enter inflight (1,2,4,8,12,16): ", tmp, sizeof(tmp));
     int v = atoi(tmp);
     if (v < 1) v = 1;
     g_inflight = v;
