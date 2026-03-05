@@ -25,7 +25,7 @@ static void ClearConsoleWinAPI() {
     SetConsoleCursorPosition(hOut, home);
 }
 
-// Пауза после команды: чтобы вывод не “проскочил”
+// пїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ: пїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ пїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
 static void PauseEnter() {
     std::wcout << L"\nPress Enter to continue...";
     std::wstring tmp;
@@ -72,6 +72,44 @@ static std::wstring ReadLine(const wchar_t* prompt) {
     std::wstring s;
     std::getline(std::wcin, s);
     return s;
+}
+
+static void PrintErrorDetailed(const wchar_t* action, DWORD err = GetLastError()) {
+    std::wcerr << action << L" failed";
+    switch (err) {
+        case ERROR_FILE_EXISTS:
+        case ERROR_ALREADY_EXISTS:
+            std::wcerr << L": object already exists";
+            break;
+        case ERROR_FILE_NOT_FOUND:
+            std::wcerr << L": file not found";
+            break;
+        case ERROR_PATH_NOT_FOUND:
+            std::wcerr << L": path not found";
+            break;
+        case ERROR_ACCESS_DENIED:
+            std::wcerr << L": access denied";
+            break;
+        case ERROR_DIR_NOT_EMPTY:
+            std::wcerr << L": directory is not empty";
+            break;
+        case ERROR_SHARING_VIOLATION:
+            std::wcerr << L": object is used by another process";
+            break;
+        case ERROR_NOT_READY:
+            std::wcerr << L": device is not ready";
+            break;
+        case ERROR_INVALID_NAME:
+            std::wcerr << L": invalid path or file name";
+            break;
+        case ERROR_DIRECTORY:
+            std::wcerr << L": specified path is not a directory";
+            break;
+        default:
+            std::wcerr << L": " << LastErrorMsg(err);
+            return;
+    }
+    std::wcerr << L" (code " << err << L")\n";
 }
 
 // ------------------------ 1) GetLogicalDrives ------------------------
@@ -165,7 +203,7 @@ static void Cmd_GetVolumeInformation() {
     std::wcout << L"Max name len: " << maxCompLen << L"\n";
     std::wcout << L"FS flags    : 0x" << std::hex << fsFlags << std::dec << L"\n";
 
-    // Расшифровка возможностей
+    // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
     PrintFsFlags(fsFlags);
 }
 
@@ -192,7 +230,7 @@ static void Cmd_GetDiskFreeSpaceEx() {
 static void Cmd_CreateDirectory() {
     std::wstring path = ReadLine(L"Enter directory path to create: ");
     BOOL ok = CreateDirectoryW(path.c_str(), nullptr);
-    if (!ok) std::wcerr << L"CreateDirectoryW failed: " << LastErrorMsg() << L"\n";
+    if (!ok) PrintErrorDetailed(L"CreateDirectoryW");
     else std::wcout << L"OK\n";
 }
 
@@ -201,7 +239,7 @@ static void Cmd_CreateDirectory() {
 static void Cmd_RemoveDirectory() {
     std::wstring path = ReadLine(L"Enter directory path to remove (must be empty): ");
     BOOL ok = RemoveDirectoryW(path.c_str());
-    if (!ok) std::wcerr << L"RemoveDirectoryW failed: " << LastErrorMsg() << L"\n";
+    if (!ok) PrintErrorDetailed(L"RemoveDirectoryW");
     else std::wcout << L"OK\n";
 }
 
@@ -220,7 +258,7 @@ static void Cmd_CreateFile() {
         nullptr
     );
     if (h == INVALID_HANDLE_VALUE) {
-        std::wcerr << L"CreateFileW failed: " << LastErrorMsg() << L"\n";
+        PrintErrorDetailed(L"CreateFileW");
         return;
     }
 
@@ -236,7 +274,7 @@ static void Cmd_CopyFile() {
     BOOL failIfExists = (!s.empty() && s[0] == L'1');
 
     BOOL ok = CopyFileW(src.c_str(), dst.c_str(), failIfExists);
-    if (!ok) std::wcerr << L"CopyFileW failed: " << LastErrorMsg() << L"\n";
+    if (!ok) PrintErrorDetailed(L"CopyFileW");
     else std::wcout << L"OK\n";
 }
 
@@ -247,7 +285,7 @@ static void Cmd_MoveFile() {
     std::wstring dst = ReadLine(L"Enter destination file: ");
 
     BOOL ok = MoveFileW(src.c_str(), dst.c_str());
-    if (!ok) std::wcerr << L"MoveFileW failed: " << LastErrorMsg() << L"\n";
+    if (!ok) PrintErrorDetailed(L"MoveFileW");
     else std::wcout << L"OK\n";
 }
 
@@ -261,7 +299,7 @@ static void Cmd_MoveFileEx() {
     if (!s.empty() && s[0] == L'1') flags |= MOVEFILE_REPLACE_EXISTING;
 
     BOOL ok = MoveFileExW(src.c_str(), dst.c_str(), flags);
-    if (!ok) std::wcerr << L"MoveFileExW failed: " << LastErrorMsg() << L"\n";
+    if (!ok) PrintErrorDetailed(L"MoveFileExW");
     else std::wcout << L"OK\n";
 }
 
@@ -271,7 +309,7 @@ static void Cmd_GetFileAttributes() {
     std::wstring path = ReadLine(L"Enter file path: ");
     DWORD attrs = GetFileAttributesW(path.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES) {
-        std::wcerr << L"GetFileAttributesW failed: " << LastErrorMsg() << L"\n";
+        PrintErrorDetailed(L"GetFileAttributesW");
         return;
     }
     std::wcout << L"Attributes mask: 0x" << std::hex << attrs << std::dec << L"\n";
@@ -290,7 +328,7 @@ static void Cmd_SetFileAttributes() {
 
     DWORD attrs = GetFileAttributesW(path.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES) {
-        std::wcerr << L"GetFileAttributesW failed: " << LastErrorMsg() << L"\n";
+        PrintErrorDetailed(L"GetFileAttributesW");
         return;
     }
 
@@ -299,7 +337,7 @@ static void Cmd_SetFileAttributes() {
     else       newAttrs &= ~FILE_ATTRIBUTE_READONLY;
 
     BOOL ok = SetFileAttributesW(path.c_str(), newAttrs);
-    if (!ok) std::wcerr << L"SetFileAttributesW failed: " << LastErrorMsg() << L"\n";
+    if (!ok) PrintErrorDetailed(L"SetFileAttributesW");
     else std::wcout << L"OK\n";
 }
 
@@ -311,14 +349,14 @@ static void Cmd_GetFileInformationByHandle() {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
-        std::wcerr << L"CreateFileW(open) failed: " << LastErrorMsg() << L"\n";
+        PrintErrorDetailed(L"CreateFileW(open)");
         return;
     }
 
     BY_HANDLE_FILE_INFORMATION info{};
     BOOL ok = GetFileInformationByHandle(h, &info);
     if (!ok) {
-        std::wcerr << L"GetFileInformationByHandle failed: " << LastErrorMsg() << L"\n";
+        PrintErrorDetailed(L"GetFileInformationByHandle");
         CloseHandle(h);
         return;
     }
@@ -339,14 +377,14 @@ static void PrintFileTime(const wchar_t* label, const FILETIME& ft) {
         return;
     }
 
-    // UTC SYSTEMTIME -> local SYSTEMTIME (важно для “как в проводнике”)
+    // UTC SYSTEMTIME -> local SYSTEMTIME (пїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅ пїЅпїЅпїЅпїЅ пїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ)
     FILETIME localFt{};
     if (!SystemTimeToFileTime(&utc, &localFt)) {
         std::wcout << label << L": <convert error>\n";
         return;
     }
     if (!FileTimeToLocalFileTime(&ft, &localFt)) {
-        // fallback: просто печатаем UTC
+        // fallback: пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ UTC
         std::wcout << label << L" (UTC): "
                    << utc.wDay << L"." << utc.wMonth << L"." << utc.wYear << L" "
                    << utc.wHour << L":" << utc.wMinute << L":" << utc.wSecond << L"\n";
@@ -370,14 +408,14 @@ static void Cmd_GetFileTime() {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
-        std::wcerr << L"CreateFileW(open) failed: " << LastErrorMsg() << L"\n";
+        PrintErrorDetailed(L"CreateFileW(open)");
         return;
     }
 
     FILETIME c{}, a{}, w{};
     BOOL ok = GetFileTime(h, &c, &a, &w);
     if (!ok) {
-        std::wcerr << L"GetFileTime failed: " << LastErrorMsg() << L"\n";
+        PrintErrorDetailed(L"GetFileTime");
         CloseHandle(h);
         return;
     }
@@ -397,13 +435,13 @@ static void Cmd_SetFileTime() {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
-        std::wcerr << L"CreateFileW(open) failed: " << LastErrorMsg() << L"\n";
+        PrintErrorDetailed(L"CreateFileW(open)");
         return;
     }
 
     FILETIME c0{}, a0{}, w0{};
     if (!GetFileTime(h, &c0, &a0, &w0)) {
-        std::wcerr << L"GetFileTime(before) failed: " << LastErrorMsg() << L"\n";
+        PrintErrorDetailed(L"GetFileTime(before)");
         CloseHandle(h);
         return;
     }
@@ -411,7 +449,7 @@ static void Cmd_SetFileTime() {
     std::wcout << L"Before:\n";
     PrintFileTime(L"Last write", w0);
 
-    // Берём текущее системное время (UTC) и ставим его как LastWriteTime
+    // пїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ (UTC) пїЅ пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅ пїЅпїЅпїЅ LastWriteTime
     SYSTEMTIME st{};
     GetSystemTime(&st);
 
@@ -420,14 +458,14 @@ static void Cmd_SetFileTime() {
 
     BOOL ok = SetFileTime(h, nullptr, nullptr, &ftNow);
     if (!ok) {
-        std::wcerr << L"SetFileTime failed: " << LastErrorMsg() << L"\n";
+        PrintErrorDetailed(L"SetFileTime");
         CloseHandle(h);
         return;
     }
 
     FILETIME c1{}, a1{}, w1{};
     if (!GetFileTime(h, &c1, &a1, &w1)) {
-        std::wcerr << L"GetFileTime(after) failed: " << LastErrorMsg() << L"\n";
+        PrintErrorDetailed(L"GetFileTime(after)");
         CloseHandle(h);
         return;
     }
@@ -464,10 +502,15 @@ static int Menu() {
     std::wstring s;
     std::getline(std::wcin, s);
     if (s.empty()) return -1;
-    return std::stoi(s);
+    try {
+        return std::stoi(s);
+    } catch (...) {
+        return -1;
+    }
 }
 
 int main() {
+    SetConsoleCP(CP_UTF8);
     SetConsoleOutputCP(CP_UTF8);
     std::locale::global(std::locale(""));
 
@@ -476,7 +519,7 @@ int main() {
 
         if (c == 0) return 0;
 
-        // CLR: очищаем консоль перед выполнением новой команды
+        // CLR: пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ
         ClearConsoleWinAPI();
 
         switch (c) {
