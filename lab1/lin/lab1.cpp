@@ -332,7 +332,7 @@ static void cmd_copy() {
                 if (r->result == 0) {
                     r->state = 0;
                 } else {
-                    if (submit_write(w, r->buffer, (size_t)r->result, r->aio.aio_offset) != 0) {
+                    if (submit_write(w, r->buffer, (size_t)r->result, r->aio.aio_offset) < 0) {
                         g_error = 1;
                         break;
                     }
@@ -362,7 +362,7 @@ static void cmd_copy() {
                     size_t left = asked - (size_t)wr;
                     off_t next_off = w->aio.aio_offset + wr;
 
-                    if (submit_write(w, next_buf, left, next_off) != 0) {
+                    if (submit_write(w, next_buf, left, next_off) < 0) {
                         g_error = 1;
                         break;
                     }
