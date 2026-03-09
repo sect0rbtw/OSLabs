@@ -1,4 +1,5 @@
 // lab1.cpp
+// dd if=/dev/zero of=test1gb.bin bs=1M count=1024
 // Build:
 //   g++ -std=c++17 -O2 lab1.cpp -o aio_menu -pthread
 // Run:
