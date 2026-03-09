@@ -22,7 +22,6 @@
 #include <inttypes.h>
 #include <time.h>
 
-// ===== CLR + pause =====
 static void clr() {
     printf("\033[2J\033[H");
     fflush(stdout);
@@ -34,7 +33,6 @@ static void pause_enter() {
     do { c = getchar(); } while (c != '\n' && c != EOF);
 }
 
-// ===== утилиты =====
 static void print_errno(const char* where) {
     fprintf(stderr, "%s failed: %s\n", where, strerror(errno));
     fflush(stderr);
@@ -50,7 +48,6 @@ static void read_line(const char* prompt, char* out, size_t out_sz) {
     out[strcspn(out, "\n")] = 0;
 }
 
-// ---- “атомарность” без <atomic> ----
 static inline int64_t atomic_add64(volatile int64_t* p, int64_t v) {
     return __sync_add_and_fetch(p, v);
 }
@@ -61,14 +58,12 @@ static inline int64_t atomic_load64(volatile int64_t* p) {
 struct aio_operation {
     struct aiocb aio;
     char *buffer;
-    int write_operation;   // 0=read, 1=write
-    void* next_operation;  // read->write
-
-    volatile sig_atomic_t state; // 0=idle,1=reading,2=read_done,3=writing,4=write_done,-1=error
+    int write_operation;
+    void* next_operation;
+    volatile sig_atomic_t state; // 0=idle,1=reading,3=writing,5=buffer_busy,-1=error
     ssize_t result;
 };
 
-// ===== глобальное состояние =====
 static int g_fd_in  = -1;
 static int g_fd_out = -1;
 
@@ -89,14 +84,52 @@ static char g_dst[1024] = {0};
 static struct aio_operation* g_ops = NULL;
 static int g_ops_count = 0;
 
-// ===== освобождение =====
 static void close_all() {
     if (g_fd_in != -1)  { close(g_fd_in);  g_fd_in  = -1; }
     if (g_fd_out != -1) { close(g_fd_out); g_fd_out = -1; }
 }
 
+static void aio_completion_handler(sigval_t sigval) {
+    (void)sigval;
+}
+
+static void wait_all_active_ops() {
+    if (!g_ops) return;
+
+    for (;;) {
+        int activeCount = 0;
+        const struct aiocb** activeList =
+            (const struct aiocb**)alloca((size_t)g_ops_count * sizeof(struct aiocb*));
+
+        for (int i = 0; i < g_ops_count; ++i) {
+            if (g_ops[i].state == 1 || g_ops[i].state == 3) {
+                int err = aio_error(&g_ops[i].aio);
+                if (err == EINPROGRESS) {
+                    activeList[activeCount++] = &g_ops[i].aio;
+                } else {
+                    (void)aio_return(&g_ops[i].aio);
+                    g_ops[i].state = 0;
+                }
+            }
+        }
+
+        if (activeCount == 0) break;
+        if (aio_suspend(activeList, activeCount, NULL) != 0 && errno != EINTR) break;
+    }
+}
+
 static void free_ops() {
     if (!g_ops) return;
+
+    for (int i = 0; i < g_ops_count; ++i) {
+        if (g_ops[i].state == 1 || g_ops[i].state == 3) {
+            int fd = g_ops[i].aio.aio_fildes;
+            if (fd >= 0) aio_cancel(fd, &g_ops[i].aio);
+        }
+    }
+
+    wait_all_active_ops();
+
     for (int i = 0; i < g_ops_count; ++i) {
         if (g_ops[i].buffer) free(g_ops[i].buffer);
         g_ops[i].buffer = NULL;
@@ -106,41 +139,6 @@ static void free_ops() {
     g_ops_count = 0;
 }
 
-// ===== completion handler (SIGEV_THREAD) =====
-static void aio_completion_handler(sigval_t sigval) {
-    struct aio_operation *aio_op = (struct aio_operation *)sigval.sival_ptr;
-
-    int err = aio_error(&aio_op->aio);
-    if (err != 0) {
-        if (err != EINPROGRESS) {
-            g_error = 1;
-            aio_op->state = -1;
-            atomic_add64(&g_pending64, -1);
-        }
-        return;
-    }
-
-    ssize_t ret = aio_return(&aio_op->aio);
-    if (ret < 0) {
-        g_error = 1;
-        aio_op->state = -1;
-        atomic_add64(&g_pending64, -1);
-        return;
-    }
-
-    aio_op->result = ret;
-
-    if (aio_op->write_operation) {
-        atomic_add64(&g_total_written64, (int64_t)ret);
-        aio_op->state = 4; // write_done
-    } else {
-        aio_op->state = 2; // read_done
-    }
-
-    atomic_add64(&g_pending64, -1);
-}
-
-// ===== submit read =====
 static int submit_read(struct aio_operation* read_op, struct aio_operation* write_op, off_t off) {
     if (off >= g_file_size) return 0;
 
@@ -151,13 +149,12 @@ static int submit_read(struct aio_operation* read_op, struct aio_operation* writ
     read_op->write_operation = 0;
     read_op->next_operation = (void*)write_op;
     read_op->result = 0;
-    read_op->state = 1; // reading
+    read_op->state = 1;
 
     read_op->aio.aio_fildes  = g_fd_in;
     read_op->aio.aio_buf     = read_op->buffer;
     read_op->aio.aio_nbytes  = need;
     read_op->aio.aio_offset  = off;
-
     read_op->aio.aio_sigevent.sigev_notify = SIGEV_THREAD;
     read_op->aio.aio_sigevent.sigev_notify_function = aio_completion_handler;
     read_op->aio.aio_sigevent.sigev_value.sival_ptr = read_op;
@@ -182,13 +179,12 @@ static int submit_write(struct aio_operation* write_op, char* buf, size_t bytes,
     memset(&write_op->aio, 0, sizeof(write_op->aio));
     write_op->write_operation = 1;
     write_op->result = 0;
-    write_op->state = 3; // writing
+    write_op->state = 3;
 
     write_op->aio.aio_fildes  = g_fd_out;
     write_op->aio.aio_buf     = buf;
     write_op->aio.aio_nbytes  = bytes;
     write_op->aio.aio_offset  = off;
-
     write_op->aio.aio_sigevent.sigev_notify = SIGEV_THREAD;
     write_op->aio.aio_sigevent.sigev_notify_function = aio_completion_handler;
     write_op->aio.aio_sigevent.sigev_value.sival_ptr = write_op;
@@ -208,14 +204,12 @@ static int all_slots_idle() {
     for (int i = 0; i < g_inflight; ++i) {
         struct aio_operation* r = &g_ops[i*2 + 0];
         struct aio_operation* w = &g_ops[i*2 + 1];
-
-        if (r->state == 1 || r->state == 2) return 0;
-        if (w->state == 3 || w->state == 4) return 0;
+        if (r->state != 0) return 0;
+        if (w->state != 0) return 0;
     }
     return 1;
 }
 
-// ===== команды меню (разделены) =====
 static void cmd_set_paths() {
     read_line("Enter source path: ", g_src, sizeof(g_src));
     read_line("Enter destination path: ", g_dst, sizeof(g_dst));
@@ -267,12 +261,11 @@ static void cmd_set_inflight() {
 }
 
 static void cmd_close_free() {
-    close_all();
     free_ops();
+    close_all();
     printf("closed + freed\n");
 }
 
-// ===== основной пункт: Copy =====
 static void cmd_copy() {
     if (g_fd_in < 0 || g_fd_out < 0) { printf("open src and dst first\n"); return; }
     if (g_file_size <= 0) { printf("run fstat first (file size must be > 0)\n"); return; }
@@ -319,76 +312,6 @@ static void cmd_copy() {
     }
 
     while (!g_done && !g_error) {
-        for (int i = 0; i < g_inflight && !g_error; ++i) {
-            struct aio_operation* r = &g_ops[i*2 + 0];
-            struct aio_operation* w = &g_ops[i*2 + 1];
-
-            if (r->state == 2) {
-                if (r->result < 0) {
-                    g_error = 1;
-                    break;
-                }
-
-                if (r->result == 0) {
-                    r->state = 0;
-                } else {
-                    if (submit_write(w, r->buffer, (size_t)r->result, r->aio.aio_offset) < 0) {
-                        g_error = 1;
-                        break;
-                    }
-                    r->state = 0;
-                }
-            } else if (r->state == -1) {
-                g_error = 1;
-                break;
-            }
-        }
-
-        for (int i = 0; i < g_inflight && !g_error; ++i) {
-            struct aio_operation* r = &g_ops[i*2 + 0];
-            struct aio_operation* w = &g_ops[i*2 + 1];
-
-            if (w->state == 4) {
-                ssize_t wr = w->result;
-                size_t asked = (size_t)w->aio.aio_nbytes;
-
-                if (wr < 0) {
-                    g_error = 1;
-                    break;
-                }
-
-                if ((size_t)wr < asked) {
-                    char* next_buf = ((char*)w->aio.aio_buf) + wr;
-                    size_t left = asked - (size_t)wr;
-                    off_t next_off = w->aio.aio_offset + wr;
-
-                    if (submit_write(w, next_buf, left, next_off) < 0) {
-                        g_error = 1;
-                        break;
-                    }
-                    continue;
-                }
-
-                w->state = 0;
-
-                if (g_next_offset < g_file_size) {
-                    int rc = submit_read(r, w, g_next_offset);
-                    if (rc < 0) { g_error = 1; break; }
-                    if (rc > 0) g_next_offset += (off_t)g_block_size;
-                }
-            } else if (w->state == -1) {
-                g_error = 1;
-                break;
-            }
-        }
-
-        if (g_next_offset >= g_file_size &&
-            atomic_load64(&g_pending64) == 0 &&
-            all_slots_idle()) {
-            g_done = 1;
-            break;
-        }
-
         int activeCount = 0;
         const struct aiocb** activeList =
             (const struct aiocb**)alloca((size_t)g_ops_count * sizeof(struct aiocb*));
@@ -406,8 +329,91 @@ static void cmd_copy() {
                 g_error = 1;
                 break;
             }
-        } else {
-            usleep(1000);
+        }
+
+        for (int i = 0; i < g_inflight && !g_error; ++i) {
+            struct aio_operation* r = &g_ops[i*2 + 0];
+            struct aio_operation* w = &g_ops[i*2 + 1];
+
+            if (r->state == 1) {
+                int err = aio_error(&r->aio);
+                if (err == 0) {
+                    ssize_t rd = aio_return(&r->aio);
+                    atomic_add64(&g_pending64, -1);
+                    r->result = rd;
+                    r->state = 0;
+
+                    if (rd < 0) {
+                        g_error = 1;
+                        break;
+                    }
+
+                    if (rd > 0) {
+                        if (submit_write(w, r->buffer, (size_t)rd, r->aio.aio_offset) < 0) {
+                            g_error = 1;
+                            break;
+                        }
+                        r->state = 5;
+                    }
+                } else if (err != EINPROGRESS) {
+                    (void)aio_return(&r->aio);
+                    atomic_add64(&g_pending64, -1);
+                    g_error = 1;
+                    break;
+                }
+            }
+
+            if (w->state == 3) {
+                int err = aio_error(&w->aio);
+                if (err == 0) {
+                    ssize_t wr = aio_return(&w->aio);
+                    atomic_add64(&g_pending64, -1);
+                    w->result = wr;
+
+                    if (wr < 0) {
+                        w->state = 0;
+                        r->state = 0;
+                        g_error = 1;
+                        break;
+                    }
+
+                    size_t asked = (size_t)w->aio.aio_nbytes;
+                    if ((size_t)wr < asked) {
+                        char* next_buf = ((char*)w->aio.aio_buf) + wr;
+                        size_t left = asked - (size_t)wr;
+                        off_t next_off = w->aio.aio_offset + wr;
+                        w->state = 0;
+                        if (submit_write(w, next_buf, left, next_off) < 0) {
+                            g_error = 1;
+                            break;
+                        }
+                    } else {
+                        atomic_add64(&g_total_written64, wr);
+                        w->state = 0;
+                        r->state = 0;
+
+                        if (g_next_offset < g_file_size) {
+                            int rc = submit_read(r, w, g_next_offset);
+                            if (rc < 0) { g_error = 1; break; }
+                            if (rc > 0) g_next_offset += (off_t)g_block_size;
+                        }
+                    }
+                } else if (err != EINPROGRESS) {
+                    (void)aio_return(&w->aio);
+                    atomic_add64(&g_pending64, -1);
+                    w->state = 0;
+                    r->state = 0;
+                    g_error = 1;
+                    break;
+                }
+            }
+        }
+
+        if (g_next_offset >= g_file_size &&
+            atomic_load64(&g_pending64) == 0 &&
+            all_slots_idle()) {
+            g_done = 1;
+            break;
         }
     }
 
