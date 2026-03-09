@@ -1,4 +1,5 @@
 // lab1.cpp
+// dd if=/dev/zero of=test1gb.bin bs=1M count=1024
 // Build:
 //   g++ -std=c++17 -O2 lab1.cpp -o aio_menu -pthread
 // Run:
@@ -99,7 +100,8 @@ static void wait_all_active_ops() {
     for (;;) {
         int activeCount = 0;
         const struct aiocb** activeList =
-            (const struct aiocb**)alloca((size_t)g_ops_count * sizeof(struct aiocb*));
+            (const struct aiocb**)malloc((size_t)g_ops_count * sizeof(struct aiocb*));
+        if (!activeList) return;
 
         for (int i = 0; i < g_ops_count; ++i) {
             if (g_ops[i].state == 1 || g_ops[i].state == 3) {
@@ -113,8 +115,17 @@ static void wait_all_active_ops() {
             }
         }
 
-        if (activeCount == 0) break;
-        if (aio_suspend(activeList, activeCount, NULL) != 0 && errno != EINTR) break;
+        if (activeCount == 0) {
+            free((void*)activeList);
+            break;
+        }
+
+        if (aio_suspend(activeList, activeCount, NULL) != 0 && errno != EINTR) {
+            free((void*)activeList);
+            break;
+        }
+
+        free((void*)activeList);
     }
 }
 
@@ -314,7 +325,12 @@ static void cmd_copy() {
     while (!g_done && !g_error) {
         int activeCount = 0;
         const struct aiocb** activeList =
-            (const struct aiocb**)alloca((size_t)g_ops_count * sizeof(struct aiocb*));
+            (const struct aiocb**)malloc((size_t)g_ops_count * sizeof(struct aiocb*));
+        if (!activeList) {
+            printf("malloc activeList failed\n");
+            g_error = 1;
+            break;
+        }
 
         for (int i = 0; i < g_ops_count; ++i) {
             if (g_ops[i].state == 1 || g_ops[i].state == 3) {
@@ -325,11 +341,14 @@ static void cmd_copy() {
         if (activeCount > 0) {
             int s = aio_suspend(activeList, activeCount, NULL);
             if (s != 0 && errno != EINTR) {
+                free((void*)activeList);
                 print_errno("aio_suspend");
                 g_error = 1;
                 break;
             }
         }
+
+        free((void*)activeList);
 
         for (int i = 0; i < g_inflight && !g_error; ++i) {
             struct aio_operation* r = &g_ops[i*2 + 0];
