@@ -91,7 +91,93 @@ static void close_all() {
 }
 
 static void aio_completion_handler(sigval_t sigval) {
-    (void)sigval;
+    struct aio_operation *aio_op = (struct aio_operation *)sigval.sival_ptr;
+    if (!aio_op) return;
+
+    int err = aio_error(&aio_op->aio);
+    if (err == EINPROGRESS) return;
+
+    ssize_t ret = aio_return(&aio_op->aio);
+    atomic_add64(&g_pending64, -1);
+    aio_op->result = ret;
+
+    if (err != 0 || ret < 0) {
+        aio_op->state = 0;
+        if (aio_op->write_operation) {
+            for (int i = 0; i < g_inflight; ++i) {
+                struct aio_operation* r = &g_ops[i*2 + 0];
+                struct aio_operation* w = &g_ops[i*2 + 1];
+                if (w == aio_op) {
+                    r->state = 0;
+                    break;
+                }
+            }
+        }
+        g_error = 1;
+        return;
+    }
+
+    if (aio_op->write_operation) {
+        size_t asked = (size_t)aio_op->aio.aio_nbytes;
+
+        // частичная запись: дописать остаток
+        if ((size_t)ret < asked) {
+            char* next_buf = ((char*)aio_op->aio.aio_buf) + ret;
+            size_t left = asked - (size_t)ret;
+            off_t next_off = aio_op->aio.aio_offset + ret;
+
+            aio_op->state = 0;
+            if (submit_write(aio_op, next_buf, left, next_off) < 0) {
+                for (int i = 0; i < g_inflight; ++i) {
+                    struct aio_operation* r = &g_ops[i*2 + 0];
+                    struct aio_operation* w = &g_ops[i*2 + 1];
+                    if (w == aio_op) {
+                        r->state = 0;
+                        break;
+                    }
+                }
+                g_error = 1;
+            }
+            return;
+        }
+
+        atomic_add64(&g_total_written64, ret);
+
+        aio_op->state = 0;
+        for (int i = 0; i < g_inflight; ++i) {
+            struct aio_operation* r = &g_ops[i*2 + 0];
+            struct aio_operation* w = &g_ops[i*2 + 1];
+            if (w == aio_op) {
+                r->state = 0;
+                break;
+            }
+        }
+
+        if (atomic_load64(&g_total_written64) >= (int64_t)g_file_size) {
+            g_done = 1;
+        }
+    } else {
+        // операция чтения
+        if (ret == 0) {
+            aio_op->state = 0;
+            return;
+        }
+
+        struct aio_operation* write_op = (struct aio_operation*)aio_op->next_operation;
+        if (!write_op) {
+            aio_op->state = 0;
+            g_error = 1;
+            return;
+        }
+
+        if (submit_write(write_op, aio_op->buffer, (size_t)ret, aio_op->aio.aio_offset) < 0) {
+            aio_op->state = 0;
+            g_error = 1;
+            return;
+        }
+
+        aio_op->state = 5; // буфер занят, пока не завершится связанная запись
+    }
 }
 
 static void wait_all_active_ops() {
@@ -400,66 +486,50 @@ static void cmd_copy() {
     }
 
     while (!g_done && !g_error) {
-        int progress = 0;
+    // если есть свободные слоты — дозапускаем новые чтения
+    for (int i = 0; i < g_inflight && g_next_offset < g_file_size && !g_error; ++i) {
+        struct aio_operation* r = &g_ops[i*2 + 0];
+        struct aio_operation* w = &g_ops[i*2 + 1];
 
-        for (int i = 0; i < g_inflight && !g_error; ++i) {
-            struct aio_operation* r = &g_ops[i*2 + 0];
-            struct aio_operation* w = &g_ops[i*2 + 1];
-            int rc = process_read_completion(r, w);
-            if (rc < 0) break;
-            if (rc > 0) progress = 1;
-        }
-
-        for (int i = 0; i < g_inflight && !g_error; ++i) {
-            struct aio_operation* r = &g_ops[i*2 + 0];
-            struct aio_operation* w = &g_ops[i*2 + 1];
-            int rc = process_write_completion(r, w);
-            if (rc < 0) break;
-            if (rc > 0) {
-                progress = 1;
-                if (g_next_offset < g_file_size && r->state == 0 && w->state == 0) {
-                    int sr = submit_read(r, w, g_next_offset);
-                    if (sr < 0) { g_error = 1; break; }
-                    if (sr > 0) {
-                        g_next_offset += (off_t)g_block_size;
-                    }
-                }
-            }
-        }
-
-        if (g_next_offset >= g_file_size &&
-            atomic_load64(&g_pending64) == 0 &&
-            all_slots_idle()) {
-            g_done = 1;
-            break;
-        }
-
-        if (g_error) break;
-
-        if (!progress) {
-            int activeCount = 0;
-            for (int i = 0; i < g_ops_count; ++i) {
-                if (g_ops[i].state == 1 || g_ops[i].state == 3) {
-                    activeList[activeCount++] = &g_ops[i].aio;
-                }
-            }
-
-            if (activeCount == 0) {
-                if (atomic_load64(&g_pending64) == 0) {
-                    g_error = 1;
-                    break;
-                }
-                usleep(1000);
-                continue;
-            }
-
-            int s = aio_suspend(activeList, activeCount, NULL);
-            if (s != 0 && errno != EINTR) {
-                print_errno("aio_suspend");
+        if (r->state == 0 && w->state == 0) {
+            int sr = submit_read(r, w, g_next_offset);
+            if (sr < 0) {
                 g_error = 1;
                 break;
             }
+            if (sr > 0) {
+                g_next_offset += (off_t)g_block_size;
+            }
         }
+    }
+
+    if (g_next_offset >= g_file_size &&
+        atomic_load64(&g_pending64) == 0 &&
+        all_slots_idle()) {
+        g_done = 1;
+        break;
+    }
+
+    if (g_error) break;
+
+    int activeCount = 0;
+    for (int i = 0; i < g_ops_count; ++i) {
+        if (g_ops[i].state == 1 || g_ops[i].state == 3) {
+            activeList[activeCount++] = &g_ops[i].aio;
+        }
+    }
+
+    if (activeCount == 0) {
+        usleep(1000);
+        continue;
+    }
+
+    int s = aio_suspend(activeList, activeCount, NULL);
+    if (s != 0 && errno != EINTR) {
+        print_errno("aio_suspend");
+        g_error = 1;
+        break;
+    }
     }
 
     free((void*)activeList);
