@@ -1,3 +1,10 @@
+// lab1.cpp
+// dd if=/dev/zero of=test1gb.bin bs=1M count=1024
+// Build:
+//   g++ -std=c++17 -O2 lab1.cpp -o aio_menu -pthread
+// Run:
+//   ./aio_menu
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -328,7 +335,7 @@ static void cmd_set_block() {
 
 static void cmd_set_inflight() {
     char tmp[64];
-    read_line("Enter inflight (1,2,4,8,12,16,23,26...): ", tmp, sizeof(tmp));
+    read_line("Enter inflight (1,2,4,8,12,16...): ", tmp, sizeof(tmp));
     int v = atoi(tmp);
     if (v < 1) v = 1;
     g_inflight = v;
